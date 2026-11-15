@@ -9,7 +9,10 @@
 4. 合并 / 回收期间不持有数据库写锁：所有 PyArrow IO 都在线程池执行，
    DB 只在短事务里更新元数据；
 5. 任意阶段崩溃：重启后 running 任务标记 failed、未发布 _tmp 清理、
-   已发布的 active 文件全部保留，随后继续回收无人引用的旧件。
+   已发布的 active 文件全部保留，随后继续回收无人引用的旧件；
+6. 血缘不被压实改写：合并只按行拼接，每行的 source_file_id / source_row_no
+   原样保留，多轮压实后仍指向最初的 CSV 上传批次，而不是合并件；旧三列件
+   在读取拼接时按文件身份恢复来源或标记“来源未知”，未知行不会错误归属。
 """
 from __future__ import annotations
 
@@ -151,14 +154,20 @@ class CompactionManager:
                         "无需压实（至少需要 2 个）"
                     )
                 old_ids = [f["id"] for f in files]
-                old_paths = [f["path"] for f in files]
+                old_refs = [(f["id"], f["path"]) for f in files]
                 expected_rows = sum(int(f["row_count"]) for f in files)
 
                 # 2) 读 + 合并完全在 DB 写事务之外
-                merged = await self.run_io(ps.merge_files, self._lake, old_paths)
+                #    合并按行拼接并逐行保留血缘：新件指向原上传批次，
+                #    旧三列件在此处完成血缘恢复 / “来源未知”标记后再拼接
+                merged = await self.run_io(ps.merge_files, self._lake, old_refs)
                 if merged.num_rows != expected_rows:
                     raise CompactionError(
                         f"合并后行数 {merged.num_rows} 与元数据行数 {expected_rows} 不一致，中止发布"
+                    )
+                if merged.column_names != [fld.name for fld in ps.SCHEMA]:
+                    raise CompactionError(
+                        f"合并件列结构异常: {merged.column_names}，中止发布"
                     )
 
                 # 3) 写临时件（仍未发布，崩溃不影响已提交数据）

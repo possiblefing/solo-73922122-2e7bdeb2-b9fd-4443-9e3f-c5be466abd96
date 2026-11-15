@@ -209,7 +209,8 @@ async def test_snapshot_vs_compaction() -> None:
 
         # 用旧快照路径直接读：仍是完整 30 行（不中断、不漏）
         rows_old, total_old, _ = await h.cm.run_io(
-            ps.read_filtered, s.lake_dir, snap_paths, None, None, None, 50000
+            ps.read_filtered, s.lake_dir,
+            [(f["id"], f["path"]) for f in files], None, None, None, 50000
         )
         check("旧快照读取仍为 30 行（无漏行/中断）", total_old == 30)
 
@@ -387,9 +388,9 @@ async def test_crash_recovery() -> None:
         ghost_id = ps.new_file_id("compact")
         import pyarrow as pa
         import pyarrow.parquet as pq
+        active = await h.db.list_active_files(None, DAY, DAY)
         merged = ps.merge_files(
-            s.lake_dir,
-            [f["path"] for f in (await h.db.list_active_files(None, DAY, DAY))],
+            s.lake_dir, [(f["id"], f["path"]) for f in active]
         )
         rel_tmp = ps.write_temp(s.lake_dir, ghost_id, merged)
         await h.db.set_compaction_temp(cid, rel_tmp)

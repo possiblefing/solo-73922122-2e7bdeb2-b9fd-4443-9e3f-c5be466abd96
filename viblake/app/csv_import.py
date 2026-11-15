@@ -63,9 +63,12 @@ def parse_readings(data: bytes, settings: Settings) -> list[Reading]:
 
     readings: list[Reading] = []
     day: str | None = None
+    # 非空数据行序号（不含表头，从 1 开始）；空行跳过且不占序号
+    data_line_no = 0
     for row_no, row in enumerate(reader, start=2):
         if not row or all((cell.strip() == "" for cell in row)):
-            continue  # 容忍文件末尾空行
+            continue  # 容忍文件末尾空行（空行不计入数据行序号）
+        data_line_no += 1
         if len(row) < len(header):
             raise ValidationError(f"第 {row_no} 行列数不足（表头 {len(header)} 列，实际 {len(row)} 列）")
         turbine = row[idx["turbine"]].strip()
@@ -82,7 +85,14 @@ def parse_readings(data: bytes, settings: Settings) -> list[Reading]:
                 f"第 {row_no} 行 UTC 日期 {row_day} 与首批日期 {day} 不一致；"
                 "每批必须限定在同一个 UTC 日内，请按日拆分文件"
             )
-        readings.append(Reading(turbine=turbine, ts_utc=ts, vibration=vibration))
+        readings.append(
+            Reading(
+                turbine=turbine,
+                ts_utc=ts,
+                vibration=vibration,
+                source_row_no=data_line_no,
+            )
+        )
 
     if not readings:
         raise ValidationError("CSV 没有任何数据行")

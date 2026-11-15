@@ -90,7 +90,7 @@
   <div class="grid">
     <section class="panel">
       <h2>② 上传 CSV 批次（≤ 10000 行，限同一 UTC 日）</h2>
-      <label>CSV 文件（列：<code>turbine,ts_utc,vibration</code>，重复行会原样保留）</label>
+      <label>CSV 文件（列：<code>turbine,ts_utc,vibration</code>，重复行会原样保留；每行自动记录本上传文件 ID 与非空数据行号）</label>
       <input type="file" id="csvFile" accept=".csv,text/csv" />
       <div class="row">
         <button id="uploadBtn">上传并写成一个 Parquet</button>
@@ -138,7 +138,7 @@
   </div>
 
   <section class="panel">
-    <h2>④ 查询读数（开始时固定文件集合，压实切换不漏行、不重行、不中断）</h2>
+    <h2>④ 查询读数（开始时固定文件集合，压实切换不漏行、不重行、不中断；每行附来源上传文件 ID 与行序号）</h2>
     <div class="row">
       <div>
         <label>机组号（留空=全部机组）</label>
@@ -161,9 +161,17 @@
     <div class="hint" id="queryMeta">尚未查询</div>
     <div class="scroll" style="margin-top:10px">
       <table>
-        <thead><tr><th>机组</th><th>UTC 时间</th><th>振动值</th></tr></thead>
-        <tbody id="queryBody"><tr><td colspan="3" class="muted">无结果</td></tr></tbody>
+        <thead><tr>
+          <th>机组</th><th>UTC 时间</th><th>振动值</th>
+          <th>来源上传文件 ID</th><th>非空数据行序号</th>
+        </tr></thead>
+        <tbody id="queryBody"><tr><td colspan="5" class="muted">无结果</td></tr></tbody>
       </table>
+    </div>
+    <div class="hint">
+      来源说明：每条记录标注其最初所属的 CSV 上传批次文件 ID 与该文件中的非空数据行号（不含表头，从 1 开始）；
+      内容相同的重复记录也各有独立来源。多轮压实不会改写来源。
+      <span class="pill pause">来源未知</span> 表示历史遗留压实件中无法还原来源的行，不会归属到其他批次。
     </div>
   </section>
 
@@ -321,8 +329,16 @@ $("queryBtn").onclick = async () => {
       + (r.truncated ? ' <span class="pill pause">已截断</span>' : "")
       + `（耗时 ${Math.round(performance.now() - started)} ms）`;
     $("queryBody").innerHTML = r.rows.length
-      ? r.rows.map((x) => `<tr><td>${esc(x.turbine)}</td><td>${esc(x.ts_utc)}</td><td>${x.vibration}</td></tr>`).join("")
-      : '<tr><td colspan="3" class="muted">无匹配行</td></tr>';
+      ? r.rows.map((x) => {
+          const known = x.source_file_id != null;
+          const srcCell = known
+            ? `<code>${esc(x.source_file_id)}</code>`
+            : '<span class="pill pause">来源未知</span>';
+          const rowCell = known ? esc(x.source_row_no) : '<span class="muted">—</span>';
+          return `<tr><td>${esc(x.turbine)}</td><td>${esc(x.ts_utc)}</td><td>${x.vibration}</td>`
+            + `<td>${srcCell}</td><td>${rowCell}</td></tr>`;
+        }).join("")
+      : '<tr><td colspan="5" class="muted">无匹配行</td></tr>';
   } catch (e) {
     $("queryMeta").textContent = "查询失败：" + e.message;
   }

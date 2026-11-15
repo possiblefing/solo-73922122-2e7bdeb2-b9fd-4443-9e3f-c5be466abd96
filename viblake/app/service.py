@@ -17,10 +17,16 @@ from .gates import PauseGate
 class Snapshot:
     """上下文管理器：查询期间固定文件集合，结束即释放引用。"""
 
-    def __init__(self, db: Database, snapshot_id: int, paths: list[str]) -> None:
+    def __init__(
+        self,
+        db: Database,
+        snapshot_id: int,
+        file_refs: list[ps.FileRef],
+    ) -> None:
         self._db = db
         self.snapshot_id = snapshot_id
-        self.paths = paths
+        # (文件 ID, 相对路径)：文件 ID 用于旧三列件读取时恢复/标记血缘
+        self.file_refs = file_refs
 
     async def __aenter__(self) -> "Snapshot":
         return self
@@ -101,12 +107,16 @@ class DataLakeService:
         end_day = (end - timedelta(microseconds=1)).date().isoformat() if end else None
 
         snapshot_id, files = await self._db.create_snapshot(turbine, start_day, end_day)
-        snapshot = Snapshot(self._db, snapshot_id, [f["path"] for f in files])
+        snapshot = Snapshot(
+            self._db,
+            snapshot_id,
+            [(f["id"], f["path"]) for f in files],
+        )
         try:
             rows, total_matched, scanned = await self._io(
                 ps.read_filtered,
                 self._settings.lake_dir,
-                snapshot.paths,
+                snapshot.file_refs,
                 turbine,
                 start,
                 end,

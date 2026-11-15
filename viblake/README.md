@@ -3,6 +3,9 @@
 把大量振动读数 CSV 小文件合并为按 **UTC 日分区的 Parquet**，减少故障回溯时的文件扫描。
 单进程 FastAPI 应用，PyArrow 负责 Parquet 读写，SQLite（WAL 模式）只存元数据。
 
+每条读数都带**数据血缘**：它来自哪一次 CSV 上传（来源上传文件 ID）、对应该文件的第几条
+非空数据行（不含表头，从 1 开始）。网页查询逐行展示这两个字段，用于核对重复振动读数的来源。
+
 ## 功能与约束对照
 
 | 需求 | 实现方式 |
@@ -10,12 +13,17 @@
 | 上传含机组号、UTC 时间、有限振动值的 CSV | `POST /api/readings`，整批校验：必需三列、ISO 8601 时间、有限数值、非空机组 |
 | 每批 ≤ 10000 行且限同一 UTC 日 | `app/csv_import.py` 整体校验，任一规则不满足整批拒绝（不产生任何文件） |
 | 整批追加为一个 Parquet，保留重复行 | 一批 = `lake/day=YYYY-MM-DD/<id>.parquet` 一个文件；PyArrow 拼接不去重 |
-| 浏览器按机组和时段查读数、查看文件数 | 单页面 `GET /`；`GET /api/readings/query`、`GET /api/stats` |
+| 每条记录可追溯到原上传文件 ID 与非空数据行号 | 新 Parquet 为 5 列：基础三列 + `source_file_id` + `source_row_no`；查询逐行返回，页面展示 |
+| 内容相同的记录仍各有来源 | 重复行原样保留，逐行独立记录来源（不同上传/不同行号），不做合并去重 |
+| 多轮压实后来源不能变成合并件 | 压实只按行拼接，血缘两列原样透传；任何行的 `source_file_id` 永远是最初批次 ID |
+| 旧三列 Parquet 仍可读 | 读取时按实际 schema 兼容：旧**批次件**按“本文件 ID + 行内次序 1..N”恢复来源；旧**压实件**无法判定，两字段为 null（页面显示“来源未知”） |
+| 新旧混合压实不把未知行误记到别的批次 | 每个文件先独立补血缘再拼接；未知行始终为 null，不会借用同批其他文件的 ID |
+| 浏览器按机组和时段查读数、查看文件数与来源 | 单页面 `GET /`；`GET /api/readings/query`、`GET /api/stats` |
 | 启动压实，一次只压实一份日分区 | `POST /api/compactions?day=...`，进程内锁 + DB running 任务双重互斥，并发请求返回 409 |
 | 合并启动时该日文件为一个 | 任务启动在同一事务内固定当时的 active 文件集合 |
 | 压实期间仍能上传/查询，后来上传的文件须保留 | Parquet IO 在线程池、DB 仅短事务；新上传文件不并入本次任务，发布后仍为独立 active 文件 |
 | 查询固定开始时的文件集合，切换不漏行、不重行、不中断 | 查询开始即创建 `snapshots/snapshot_files` 读快照，全程读快照内文件；压实只把旧件置 `superseded` |
-| 旧文件无人读取后才回收 | 旧件被快照引用期间保留；引用归零后由 2 秒周期的后台回收器删除并登记 `deleted` |
+| 旧文件无人读取后才回收，回收不打断查询 | 旧件被快照引用期间保留；引用归零后由 2 秒周期的后台回收器删除并登记 `deleted`；来源在快照保护的文件内解析 |
 | 读写 Parquet 不持数据库写锁 | 所有 PyArrow 调用均在 DB 事务之外的线程池中执行，DB 写事务只更新几行元数据 |
 | 失败/切换中退出，重启保留完整已提交数据、清掉未发布新件、续完旧件回收 | 启动 `recover()`：running 任务置 failed、`_tmp/` 全清、磁盘孤儿清理、立即执行一轮回收 |
 | 暂停合并及查询的演示开关 | `POST /api/demo/gates/merge|query?paused=true|false`，状态持久化于 SQLite，重启保持 |
@@ -36,7 +44,7 @@ viblake/
 │   ├── gates.py           # 暂停合并 / 暂停查询开关
 │   ├── config.py          # 环境变量配置
 │   └── web/index.html     # 单页面（无外部前端依赖）
-├── tests/                 # 59 项断言的集成测试 + HTTP 冒烟测试
+├── tests/                 # 集成测试（59 项断言）+ 血缘专项（41 项）+ HTTP 冒烟 + 硬崩溃演练
 ├── examples/              # 示例 CSV（含重复行示例）
 ├── Dockerfile
 └── docker-compose.yml
@@ -75,7 +83,7 @@ curl -X POST "http://localhost:8000/api/compactions?day=2026-11-13"
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/api/readings` | 上传 CSV（multipart 字段 `file`），422 = 整批校验失败 |
-| GET | `/api/readings/query` | 参数 `turbine,start,end,limit`；返回快照 id、快照文件数、命中/返回行数 |
+| GET | `/api/readings/query` | 参数 `turbine,start,end,limit`；返回快照 id、快照文件数、命中/返回行数；每行含 `source_file_id`、`source_row_no`（null = 来源未知） |
 | GET | `/api/stats` | 各日分区 active/superseded/deleted 文件数与行数、开关状态 |
 | POST | `/api/compactions?day=YYYY-MM-DD` | 后台压实，202 立即返回；重复请求 409 |
 | GET | `/api/compactions[/{id}]` | 任务历史 / 单任务状态（running/published/failed） |
@@ -85,6 +93,23 @@ curl -X POST "http://localhost:8000/api/compactions?day=2026-11-13"
 | GET | `/health` | 健康检查，含本次启动恢复报告 |
 
 ## 正确性设计要点
+
+### 数据血缘（每条读数的来源追溯）
+
+1. **上传即落血缘**：CSV 解析时为每条非空数据行编号（不含表头，空行跳过且不占号），
+   写入 Parquet 时附两列——`source_file_id`（本次上传批次的文件 ID，即网页所见的原上传文件 ID）
+   与 `source_row_no`（非空数据行序号，从 1 开始）。内容完全相同的重复读数也各自成行、各有来源；
+2. **压实不改血缘**：`merge_files` 只做按行 `concat`，血缘列随数据行原样透传。
+   多轮压实后，每行仍指向**最初那次 CSV 上传**的批次 ID，而不是任何压实合并件；
+3. **旧三列 Parquet 兼容**：读取时不强制 schema，按 Parquet 实际列数判断。
+   - 旧**批次件**（文件 ID 以 `batch-` 开头）：一批就是一次上传，按行内次序恢复
+     `source_file_id=本文件 ID`、`source_row_no=1..N`；
+   - 旧**压实件**（`compact-` 开头，以及任何无法确认身份的文件）：其中混合了多个批次且无内嵌血缘，
+     保守地把两列置 null，查询返回 null、页面显示 **“来源未知”**；
+4. **混合压实不串批次**：新旧文件一起压实时，每个文件先独立补血缘再拼接，
+   未知行始终保持 null，绝不会被记到同批其他（新）批次名下；
+5. **回收不影响来源**：血缘在 Parquet 文件内（不依赖外部映射表），而查询全程读快照固定的文件，
+   旧件在快照释放前不会被回收，因此来源解析不会被回收打断。
 
 ### 读快照（不漏行 / 不重行 / 不中断）
 
@@ -124,7 +149,8 @@ curl -X POST "http://localhost:8000/api/compactions?day=2026-11-13"
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
 python tests/test_integration.py   # 59 项断言：校验/重复行/快照/并发/开关/崩溃恢复/持久化
-python tests/test_http_smoke.py    # 完整 HTTP 流程（含暂停查询的请求挂起/恢复）
+python tests/test_lineage.py       # 41 项断言：上传血缘/多轮压实/旧三列件兼容/混合压实/快照回收
+python tests/test_http_smoke.py    # 完整 HTTP 流程（含暂停查询的请求挂起/恢复、API 血缘字段）
 python tests/test_crash_drill.py   # 真实多进程硬退出（os._exit）重启恢复演练
 ```
 

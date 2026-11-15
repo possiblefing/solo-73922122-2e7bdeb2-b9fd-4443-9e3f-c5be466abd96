@@ -60,6 +60,11 @@ with TestClient(app) as client:
     body = r.json()
     assert body["matched_rows"] == 3, body
     print("query WTG-07:", body["matched_rows"], "rows, snapshot", body["snapshot_id"])
+    # 血缘：三行都来自刚上传的 dup 批次，非空数据行序号 1/2/3
+    dup_src = {(row["source_file_id"], row["source_row_no"]) for row in body["rows"]}
+    assert all(src is not None and row_no in (1, 2, 3) for src, row_no in dup_src), body["rows"]
+    assert len({src for src, _ in dup_src}) == 1, "三行应来自同一个上传文件 ID"
+    print("lineage on query ok:", sorted(dup_src))
 
     # 暂停查询 -> 请求挂起；用线程验证等待行为
     r = client.post("/api/demo/gates/query?paused=true")
@@ -125,6 +130,15 @@ with TestClient(app) as client:
     all_rows = client.get("/api/readings/query?limit=50000").json()
     assert all_rows["matched_rows"] == 4 * 50 + 3, all_rows["matched_rows"]
     print("total rows after both compactions:", all_rows["matched_rows"], "(expected 203)")
+
+    # 压实后血缘仍在：每行都带来源两字段，且没有任何来源指向压实合并件
+    assert all("source_file_id" in row and "source_row_no" in row for row in all_rows["rows"])
+    job_rows = {
+        j["new_file_id"] for j in client.get("/api/compactions").json() if j["new_file_id"]
+    }
+    used_sources = {row["source_file_id"] for row in all_rows["rows"]}
+    assert not (used_sources & job_rows), (used_sources, job_rows)
+    print("lineage survives compaction: sources =", len(used_sources), "upload batch(es)")
 
     stats = client.get("/api/stats").json()
     print("final stats:", stats["totals"])
